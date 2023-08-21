@@ -1,12 +1,13 @@
+import subprocess
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
-from .base import NeotestAdapter, NeotestError, NeotestResult, NeotestResultStatus
-
 import pytest
 from _pytest._code.code import ExceptionRepr
 from _pytest.terminal import TerminalReporter
+
+from .base import NeotestAdapter, NeotestError, NeotestResult, NeotestResultStatus
 
 
 class PytestNeotestAdapter(NeotestAdapter):
@@ -16,10 +17,43 @@ class PytestNeotestAdapter(NeotestAdapter):
         stream: Callable[[str, NeotestResult], None],
     ) -> Dict[str, NeotestResult]:
         result_collector = NeotestResultCollector(self, stream=stream)
-        pytest.main(args=args, plugins=[
-            result_collector,
-            NeotestDebugpyPlugin(),
-        ])
+        pytest.main(
+            args=args,
+            plugins=[
+                result_collector,
+                NeotestDebugpyPlugin(),
+            ],
+        )
+        return result_collector.results
+
+
+class PantsNeotestAdapter(NeotestAdapter):
+    def run(
+        self,
+        args: List[str],
+        stream: Callable[[str, NeotestResult], None],
+    ) -> Dict[str, NeotestResult]:
+        result_collector = PantsResultCollector(self, stream=stream)
+
+        test_path = args[0]
+        file_path, test_name = test_path.split("::")
+
+        cmd = ["pants", "test", file_path, "--", "-k", test_name]
+
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            # Just surface the summaries for now
+            if "✓" in line or "✕" in line:
+                print(line)
+            result_collector.parse_output(line.strip())
+
+        process.communicate()
+
         return result_collector.results
 
 
@@ -80,7 +114,9 @@ class NeotestResultCollector:
         self.pytest_config = config
 
     @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_makereport(self, item: "pytest.Item", call: "pytest.CallInfo") -> None:
+    def pytest_runtest_makereport(
+        self, item: "pytest.Item", call: "pytest.CallInfo"
+    ) -> None:
         # pytest generates the report.outcome field in its internal
         # pytest_runtest_makereport implementation, so call it first.  (We don't
         # implement pytest_runtest_logreport because it doesn't have access to
@@ -118,7 +154,9 @@ class NeotestResultCollector:
                 for traceback_entry in reversed(call.excinfo.traceback):
                     if str(traceback_entry.path) == abs_path:
                         error_line = traceback_entry.lineno
-                errors.append({"message": msg_prefix + error_message, "line": error_line})
+                errors.append(
+                    {"message": msg_prefix + error_message, "line": error_line}
+                )
             else:
                 # TODO: Figure out how these are returned and how to represent
                 raise Exception(
@@ -136,6 +174,37 @@ class NeotestResultCollector:
         if not params:
             self.stream(pos_id, result)
         self.results[pos_id] = result
+
+
+class PantsResultCollector(NeotestResultCollector):
+    def parse_output(self, line: str):
+        test_name = None
+        if "succeeded" in line:
+            test_name = line.split()[0]
+            self.results[test_name] = {
+                "short": None,
+                "status": NeotestResultStatus.PASSED,
+                "errors": [],
+            }
+        elif "failed" in line:
+            test_name = line.split()[0]
+            error_msg = "TODO"
+            self.results[test_name] = {
+                "short": None,
+                "status": NeotestResultStatus.FAILED,
+                "errors": [{"message": error_msg, "line": None}],
+            }
+        elif "skipped" in line:
+            test_name = line.split()[0]
+            self.results[test_name] = {
+                "short": None,
+                "status": NeotestResultStatus.SKIPPED,
+                "errors": [],
+            }
+
+        if not test_name:
+            return
+        self.stream(line, self.results.get(test_name, {}))
 
 
 class NeotestDebugpyPlugin:
@@ -158,6 +227,7 @@ class NeotestDebugpyPlugin:
         """
         # Reference: https://github.com/microsoft/debugpy/issues/723
         import threading
+
         try:
             import pydevd
         except ImportError:
